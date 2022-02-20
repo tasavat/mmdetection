@@ -21,6 +21,8 @@ from .guided_anchor_head import FeatureAdaption, GuidedAnchorHead
 from .lad_head import LADHead
 from .ld_head import LDHead
 from .nasfcos_head import NASFCOSHead
+from .noisy_anchor_head import NoisyAnchorHead
+from .noisy_anchor_retina_head import NoisyAnchorRetinaHead
 from .paa_head import PAAHead
 from .pisa_retinanet_head import PISARetinaHead
 from .pisa_ssd_head import PISASSDHead
@@ -49,5 +51,6 @@ __all__ = [
     'CascadeRPNHead', 'EmbeddingRPNHead', 'LDHead', 'CascadeRPNHead',
     'AutoAssignHead', 'DETRHead', 'YOLOFHead', 'DeformableDETRHead',
     'SOLOHead', 'DecoupledSOLOHead', 'CenterNetHead', 'YOLOXHead',
-    'DecoupledSOLOLightHead', 'LADHead', 'TOODHead'
+    'DecoupledSOLOLightHead', 'LADHead', 'TOODHead',
+    'NoisyAnchorHead', 'NoisyAnchorRetinaHead',
 ]
