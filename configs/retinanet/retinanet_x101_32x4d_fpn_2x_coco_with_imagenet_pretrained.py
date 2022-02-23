@@ -11,4 +11,4 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         style='pytorch',
         init_cfg=dict(
-            type='Pretrained', checkpoint='checkpoints/resnext101_64x4d-ee2c6f71.pth')))
+            type='Pretrained', checkpoint='checkpoints/resnext101_32x4d-a5af3160.pth')))
