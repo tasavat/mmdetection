@@ -156,8 +156,7 @@ class TopNIoUAssigner(BaseAssigner):
             pos_inds = torch.nonzero(
                 assigned_gt_inds > 0, as_tuple=False).squeeze()
             if pos_inds.numel() > 0:
-                assigned_labels[pos_inds] = gt_labels[
-                    assigned_gt_inds[pos_inds] - 1]
+                assigned_labels[pos_inds] = gt_labels[assigned_gt_inds[pos_inds] - 1]
         else:
             assigned_labels = None
 

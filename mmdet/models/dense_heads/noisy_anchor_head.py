@@ -42,22 +42,39 @@ class NoisyAnchorHead(AnchorHead):
                  num_classes, 
                  in_channels, 
                  max_n_bbox_per_gt=30, 
-                 alpha=0.75, 
-                 gamma=1.0, 
+                 cleanliness_alpha=0.75, 
+                 reweight_gamma=1.0,
+                 focal_loss_alpha=0.25,
+                 focal_loss_gamma=2.0,
                  **kwargs):
         self.max_n_bbox_per_gt = max_n_bbox_per_gt
-        self.alpha = alpha
-        self.gamma = gamma
+        self.cleanliness_alpha = cleanliness_alpha
+        self.reweight_gamma = reweight_gamma
+        self.focal_loss_alpha = focal_loss_alpha
+        self.focal_loss_gamma = focal_loss_gamma
+
+        """
+        In Detectron1, loss is normalized by number of foreground samples in the batch.
+        When batch size is 1 per GPU, #foreground has a large variance and
+        using it lead to lower performance. Here we maintain an EMA of #foreground to
+        stabilize the normalizer.
+        """
+        self.loss_normalizer = 100  # initialize with any reasonable #fg that's not too small
+        self.loss_normalizer_momentum = 0.9
+
+        # more numerical stabilizers
+        self.logits_clip = 5.0
+        self.loss_clip = 1.0
 
         # overide default assigner with TopNIoUAssigner
         kwargs['train_cfg']['assigner'] = dict(
-                                    type='TopNIoUAssigner',
-                                    max_n_bbox_per_gt=self.max_n_bbox_per_gt,
-                                    min_pos_iou=0)
-        # overide default loss with CrossEntropyLoss
-        kwargs['loss_cls'] = dict(
-                            type='CrossEntropyLoss',
-                            use_sigmoid=True,
+                                        type='TopNIoUAssigner',
+                                        max_n_bbox_per_gt=self.max_n_bbox_per_gt,
+                                        min_pos_iou=0)
+        # overide default bbox loss with SmoothL1Loss
+        kwargs['loss_bbox'] = dict(
+                            type='SmoothL1Loss', 
+                            beta=1.0 / 9.0, 
                             loss_weight=1.0)
 
         super(NoisyAnchorHead, self).__init__(num_classes, in_channels, **kwargs)
@@ -110,11 +127,10 @@ class NoisyAnchorHead(AnchorHead):
         assign_result = self.assigner.assign(
             anchors, gt_bboxes, gt_bboxes_ignore,
             None if self.sampling else gt_labels)
-        anchor_ious = assign_result.max_overlaps
- 
         sampling_result = self.sampler.sample(assign_result, anchors, gt_bboxes)
 
         num_valid_anchors = anchors.shape[0]
+        anchor_ious = assign_result.max_overlaps
         bbox_targets = torch.zeros_like(anchors)
         bbox_weights = torch.zeros_like(anchors)
         labels = anchors.new_full((num_valid_anchors, ),
@@ -138,8 +154,7 @@ class NoisyAnchorHead(AnchorHead):
                 # Foreground is the first class since v2.5.0
                 labels[pos_inds] = 0
             else:
-                labels[pos_inds] = gt_labels[
-                    sampling_result.pos_assigned_gt_inds]
+                labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
             if self.train_cfg.pos_weight <= 0:
                 label_weights[pos_inds] = 1.0
             else:
@@ -157,7 +172,7 @@ class NoisyAnchorHead(AnchorHead):
                                   inside_flags)
             bbox_targets = unmap(bbox_targets, num_total_anchors, inside_flags)
             bbox_weights = unmap(bbox_weights, num_total_anchors, inside_flags)
-            anchor_ious = unmap(anchor_ious, num_total_anchors, inside_flags)
+            anchor_ious = unmap(anchor_ious, num_total_anchors, inside_flags, fill=0)
 
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
                 neg_inds, sampling_result, anchor_ious)
@@ -267,8 +282,8 @@ class NoisyAnchorHead(AnchorHead):
 
         return res + tuple(rest_results)
 
-    def loss_single(self, cls_score, bbox_pred, anchors, labels, label_weights,
-                    bbox_targets, bbox_weights, anchor_ious, num_total_samples):
+    def loss_single(self, cls_score, bbox_pred, anchors, anchor_ious, labels, label_weights, 
+                    bbox_targets, bbox_weights):
         """Compute loss of a single scale level.
 
         Args:
@@ -278,6 +293,8 @@ class NoisyAnchorHead(AnchorHead):
                 level with shape (N, num_anchors * 4, H, W).
             anchors (Tensor): Box reference for each scale level with shape
                 (N, num_total_anchors, 4).
+            anchor_ious (Tensor): IOU between anchors and gt boxes with shape
+                (N, num_total_anchors)
             labels (Tensor): Labels of each anchors with shape
                 (N, num_total_anchors).
             label_weights (Tensor): Label weights of each anchor with shape
@@ -286,32 +303,28 @@ class NoisyAnchorHead(AnchorHead):
                 weight shape (N, num_total_anchors, 4).
             bbox_weights (Tensor): BBox regression loss weights of each anchor
                 with shape (N, num_total_anchors, 4).
-            anchor_ious (Tensor): IOU between anchors and gt boxes with shape
-                (N, num_total_anchors)
-            num_total_samples (int): If sampling, num total samples equal to
-                the number of total anchors; Otherwise, it is the number of
-                positive anchors.
 
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
         """
 
-        def calculate_soft_labels(cls_s_list, loc_acc_list, alpha):
+        def calculate_soft_labels(
+            cls_s_list: torch.Tensor, 
+            loc_acc_list: torch.Tensor, 
+            pos_inds: torch.Tensor, 
+            alpha: float,
+        ) -> torch.Tensor:
             """
             Generate soft labels
             Args:
-                cls_s_list (Tensor): classification score of each anchor.
-                loc_acc_list (Tensor): IoU of each anchor (0 if negative).
+                cls_s_list (FloatTensor): classification score of each anchor.
+                loc_acc_list (FloatTensor): IoU of each anchor (0 if negative).
                 alpha (float): weight of localization loss [0, 1].
             Returns:
                 Tensor: soft labels of each anchor
             """
-            pos_flags = loc_acc_list > 0
-            if sum(pos_flags) == 0:
-                return torch.zeros_like(cls_s_list)
-
-            cls_s_pos = cls_s_list[pos_flags]
-            loc_acc_pos = loc_acc_list[pos_flags]
+            cls_s_pos = cls_s_list[pos_inds]
+            loc_acc_pos = loc_acc_list[pos_inds]
 
             cls_s_pos_s = cls_s_pos / cls_s_pos.mean()
             loc_acc_pos_s = loc_acc_pos / loc_acc_pos.mean()
@@ -322,11 +335,17 @@ class NoisyAnchorHead(AnchorHead):
             soft_labels_pos = loc_acc_pos.mean() + scaling * (soft_labels_pos - soft_labels_pos.min())
 
             soft_labels = torch.zeros_like(cls_s_list)
-            soft_labels[pos_flags] = soft_labels_pos
+            soft_labels[pos_inds] = soft_labels_pos
 
             return soft_labels
 
-        def calculate_reweight_coeff(cls_s_list, loc_acc_list, alpha, gamma):
+        def calculate_reweight_coeff(
+            cls_s_list: torch.Tensor,
+            loc_acc_list: torch.Tensor, 
+            pos_inds: torch.Tensor, 
+            alpha: float, 
+            gamma: float
+        ) -> torch.Tensor:
             """
             Generate re-weighting coefficients
             Args:
@@ -337,12 +356,8 @@ class NoisyAnchorHead(AnchorHead):
             Returns:
                 Tensor: loss weights of each anchor
             """
-            pos_flags = loc_acc_list > 0
-            if sum(pos_flags) == 0:
-                return torch.ones_like(cls_s_list)
-
-            cls_s_pos = cls_s_list[pos_flags]
-            loc_acc_pos = loc_acc_list[pos_flags]
+            cls_s_pos = cls_s_list[pos_inds]
+            loc_acc_pos = loc_acc_list[pos_inds]
 
             cls_s_pos_r = 1 / (1 - cls_s_pos) / (1 / (1 - cls_s_pos)).mean()
             loc_acc_pos_r = 1 / (1 - loc_acc_pos) / (1 / (1 - loc_acc_pos)).mean()
@@ -350,33 +365,118 @@ class NoisyAnchorHead(AnchorHead):
             reweight_coeff_pos = reweight_coeff_pos ** gamma
 
             reweight_coeff = torch.ones_like(cls_s_list)
-            reweight_coeff[pos_flags] = reweight_coeff_pos
+            reweight_coeff[pos_inds] = reweight_coeff_pos
 
             return reweight_coeff
 
-        # classification loss
+        def soft_sigmoid_focal_loss(
+            inputs: torch.Tensor,
+            gt_classes: torch.Tensor,
+            soft_targets: torch.Tensor,
+            foreground_idxs: torch.Tensor,
+            alpha: float = 0.25,
+            gamma: float = 2,
+            num_classes: int = 80,
+            reduction: str = "none"
+        ) -> torch.Tensor:
+            """
+            Focal Loss which accepts soft label as well, other than hard binary label. 
+            """
+            # prepare soft labels 
+            sl = soft_targets.clone().unsqueeze(1).repeat(1, num_classes).fill_(0.0)
+            sl[foreground_idxs, gt_classes[foreground_idxs].long()] = soft_targets[foreground_idxs]
+            bg_st = 1.0 - sl
+
+            # focal loss
+            p = torch.sigmoid(inputs)
+            term1 = (1 - p) ** gamma * torch.log(p)
+            term2 = p ** gamma * torch.log(1 - p)
+
+            loss = - sl * term1 * alpha - bg_st * term2 * (1 - alpha)
+
+            if reduction == "mean":
+                loss = loss.mean()
+            elif reduction == "sum":
+                loss = loss.sum()
+            return loss
+
+        """
+        # reshape tensors
         labels = labels.reshape(-1)
         label_weights = label_weights.reshape(-1)
         cls_score = cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
         anchor_ious = anchor_ious.reshape(-1)
 
-        cls_conf = F.softmax(cls_score, dim=1)
-        cls_label_conf = torch.zeros_like(labels, dtype=torch.float)
-        cls_label_score = torch.zeros_like(labels, dtype=torch.float)
-        for ind in range(len(labels)):
-            cls_label_conf[ind] = cls_conf[ind, labels[ind] - 1]
-            cls_label_score[ind] = cls_score[ind, labels[ind] - 1]
-
-        soft_labels = calculate_soft_labels(cls_label_conf, anchor_ious, self.alpha)
-        reweight_coeff = calculate_reweight_coeff(cls_label_conf, anchor_ious, self.alpha, self.gamma)
-
-        loss_cls = self.loss_cls(
-            cls_label_score, soft_labels, reweight_coeff, avg_factor=num_total_samples)
-
-        # regression loss
         bbox_targets = bbox_targets.reshape(-1, 4)
         bbox_weights = bbox_weights.reshape(-1, 4)
         bbox_pred = bbox_pred.permute(0, 2, 3, 1).reshape(-1, 4)
+        """
+
+        cls_score = torch.clamp(cls_score, -self.logits_clip, self.logits_clip)
+        cls_conf = F.sigmoid(cls_score)
+        pos_inds = anchor_ious.nonzero().squeeze(1)
+
+        # need at least 2 positive samples to compute loss
+        if len(pos_inds) < 2:
+            raise ValueError(f'Not enough positive anchors: {len(pos_inds)}')
+
+        # calculate soft labels and re-weighting coefficients
+        label_inds = torch.clamp(labels, max=self.cls_out_channels-1) # for bg class we use indices of the last class for now
+        # print(f"label_indices_unique: {torch.unique(label_inds, return_counts=True)}")
+        cls_label_conf = torch.gather(cls_conf, dim=1, index=label_inds.unsqueeze(1)).squeeze(1)
+        cls_label_score = torch.gather(cls_score, dim=1, index=label_inds.unsqueeze(1)).squeeze(1)
+
+        soft_labels = calculate_soft_labels(
+            cls_label_conf, 
+            anchor_ious, 
+            pos_inds, 
+            self.cleanliness_alpha)
+        reweight_coeff = calculate_reweight_coeff(
+            cls_label_conf, 
+            anchor_ious, 
+            pos_inds, 
+            self.cleanliness_alpha, 
+            self.reweight_gamma)
+
+        # classification loss
+        loss_cls = soft_sigmoid_focal_loss(
+            cls_score, 
+            labels, 
+            soft_labels, 
+            pos_inds, 
+            alpha=self.focal_loss_alpha, 
+            gamma=self.focal_loss_gamma, 
+            num_classes=self.cls_out_channels)
+
+        """
+        print(f'pos_inds: {pos_inds.size()}')
+        print(f"cls_score: {cls_score.min()}, {cls_score.max()}")
+        print(f'cls_label_conf: {cls_label_conf.min()}, {cls_label_conf.max()}')
+        print(f'anchor_ious: {anchor_ious.min()}, {anchor_ious.max()}')
+        print(f'soft_labels: {soft_labels.min()}, {soft_labels.max()}')
+        print(f'reweight_coeff: {reweight_coeff.min()}, {reweight_coeff.max()}')
+        print(f'cls_score: {cls_score}')
+        print()
+
+        print(f'pos_index_0: {pos_inds[0]}. label: {labels[pos_inds[0]]}')
+        print(f'cls_score_pos0: {cls_score[pos_inds[0]]}')
+        print(f'cls_label_score_pos0: {cls_label_score[pos_inds[0]]}')
+        print(f'cls_label_conf_pos0: {cls_label_conf[pos_inds[0]]}')
+        print(f'soft_labels_pos0: {soft_labels[pos_inds[0]]}')
+        print(f'anchor_ious_pos0: {anchor_ious[pos_inds[0]]}')
+        print(f'reweight_coeff_pos0: {reweight_coeff[pos_inds[0]]}')
+        print()
+
+        print(f'cls_score_0: {cls_score[0]}')
+        print(f'cls_label_score_0: {cls_label_score[0]}')
+        print(f'cls_label_conf_0: {cls_label_conf[0]}')
+        print(f'soft_labels_0: {soft_labels[0]}')
+        print(f'anchor_ious_0: {anchor_ious[0]}')
+        print(f'reweight_coeff_0: {reweight_coeff[0]}')
+        print()
+        """
+
+        # regression loss
         if self.reg_decoded_bbox:
             # When the regression loss (e.g. `IouLoss`, `GIouLoss`)
             # is applied directly on the decoded bounding boxes, it
@@ -384,11 +484,34 @@ class NoisyAnchorHead(AnchorHead):
             anchors = anchors.reshape(-1, 4)
             bbox_pred = self.bbox_coder.decode(anchors, bbox_pred)
         loss_bbox = self.loss_bbox(
-            bbox_pred,
-            bbox_targets,
-            reweight_coeff.unsqueeze(1).expand(-1, 4),
-            avg_factor=num_total_samples)
+            bbox_pred[pos_inds],
+            bbox_targets[pos_inds],
+            reduction_override='none')
 
+        # re-weight the losses
+        loss_scale_cls = loss_cls.sum().data / (loss_cls * reweight_coeff[:, None]).sum().data
+        loss_scale_bbox = loss_bbox.sum().data / (loss_bbox * reweight_coeff[pos_inds, None]).sum().data
+        loss_cls *= reweight_coeff[:, None] * loss_scale_cls
+        loss_bbox *= reweight_coeff[pos_inds, None] * loss_scale_bbox
+
+        # normalize losses
+        self.loss_normalizer = (
+            self.loss_normalizer_momentum * self.loss_normalizer
+            + (1 - self.loss_normalizer_momentum) * len(pos_inds)
+        )
+        loss_cls = loss_cls.sum()
+        loss_bbox = loss_bbox.sum()
+        loss_cls /= max(1, self.loss_normalizer)
+        loss_bbox /= max(1, self.loss_normalizer)
+        loss_cls = torch.clamp(loss_cls, 1e-4, self.loss_clip)
+        loss_bbox = torch.clamp(loss_bbox, 1e-4, self.loss_clip)
+
+        """
+        print(f'loss_cls: {loss_cls.data.item()}')
+        print(f'loss_bbox: {loss_bbox.data.item()}')
+        print()
+        print('*' * 80)
+        """
         return loss_cls, loss_bbox
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
@@ -422,8 +545,8 @@ class NoisyAnchorHead(AnchorHead):
 
         device = cls_scores[0].device
 
-        anchor_list, valid_flag_list = self.get_anchors(
-            featmap_sizes, img_metas, device=device)
+        anchor_list, valid_flag_list = self.get_anchors(featmap_sizes, img_metas, device=device)
+
         label_channels = self.cls_out_channels if self.use_sigmoid_cls else 1
         cls_reg_targets = self.get_targets(
             anchor_list,
@@ -437,8 +560,7 @@ class NoisyAnchorHead(AnchorHead):
             return None
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg, anchor_ious) = cls_reg_targets
-        num_total_samples = (
-            num_total_pos + num_total_neg if self.sampling else num_total_pos)
+        num_total_samples = (num_total_pos + num_total_neg if self.sampling else num_total_pos)
 
         # anchor number of multi levels
         num_level_anchors = [anchors.size(0) for anchors in anchor_list[0]]
@@ -448,15 +570,44 @@ class NoisyAnchorHead(AnchorHead):
             concat_anchor_list.append(torch.cat(anchor_list[i]))
         all_anchor_list = images_to_levels(concat_anchor_list, num_level_anchors)
 
+        """
         losses_cls, losses_bbox = multi_apply(
             self.loss_single,
             cls_scores,
             bbox_preds,
             all_anchor_list,
+            anchor_ious,
             labels_list,
             label_weights_list,
             bbox_targets_list,
-            bbox_weights_list,
+            bbox_weights_list)
+        """
+
+        # concat all levels into a single tensor
+        cls_scores = torch.cat(
+            [cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cs in cls_scores], dim=0)
+        bbox_preds = torch.cat(
+            [bbp.reshape(-1, 4) for bbp in bbox_preds], dim=0)
+        all_anchor_list = torch.cat(
+            [aa.reshape(-1, 4) for aa in all_anchor_list], dim=0)
+        anchor_ious = torch.cat(
+            [aa.reshape(-1) for aa in anchor_ious], dim=0)
+        labels_list = torch.cat(
+            [ll.reshape(-1) for ll in labels_list], dim=0)
+        label_weights_list = torch.cat(
+            [llw.reshape(-1) for llw in label_weights_list], dim=0)
+        bbox_targets_list = torch.cat(
+            [bbt.reshape(-1, 4) for bbt in bbox_targets_list], dim=0)
+        bbox_weights_list = torch.cat(
+            [bbw.reshape(-1, 4) for bbw in bbox_weights_list], dim=0)
+
+        losses_cls, losses_bbox = self.loss_single(
+            cls_scores,
+            bbox_preds,
+            all_anchor_list,
             anchor_ious,
-            num_total_samples=num_total_samples)
+            labels_list,
+            label_weights_list,
+            bbox_targets_list,
+            bbox_weights_list)
         return dict(loss_cls=losses_cls, loss_bbox=losses_bbox)
