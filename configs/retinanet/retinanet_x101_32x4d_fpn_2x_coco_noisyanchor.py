@@ -5,10 +5,12 @@ model = dict(
         max_n_bbox_per_gt=30,
         cleanliness_alpha=0.75,
         reweight_gamma=1.0,
-        focal_loss_alpha=0.25,
+        focal_loss_alpha=0.50,
         focal_loss_gamma=2.0,
     ),
     backbone=dict(
         init_cfg=dict(
             type='Pretrained', checkpoint='checkpoints/resnext101_32x4d-a5af3160.pth'))
     )
+# optimizer
+optimizer = dict(type='SGD', lr=0.001, momentum=0.9, weight_decay=0.0001)
