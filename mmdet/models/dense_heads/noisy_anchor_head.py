@@ -397,6 +397,7 @@ class NoisyAnchorHead(AnchorHead):
             loss = - sl * term1 * alpha - bg_st * term2 * (1 - alpha)
             return loss
 
+        """
         # we have extracted at-most [max_n_bbox_per_gt] per image/gt/scale-level
         # we now reduce the number of positive bbox to match [max_n_bbox_per_gt] per image/gt only
         # thus, we need to select top-[max_n_bbox_per_gt] from each image/gt with different scale-level
@@ -420,6 +421,8 @@ class NoisyAnchorHead(AnchorHead):
                     pos_inds[unique_img_gt_inds[top_inds]] = 1
         # convert from boolean to indices
         pos_inds = torch.nonzero(pos_inds).squeeze(1)
+        """
+        pos_inds = torch.nonzero(anchor_ious > 0).squeeze(1)
 
         # need at least 2 positive samples to compute loss
         if len(pos_inds) < 2:
@@ -480,7 +483,6 @@ class NoisyAnchorHead(AnchorHead):
         loss_bbox = loss_bbox.sum()
         loss_cls /= max(1, self.loss_normalizer)
         loss_bbox /= max(1, self.loss_normalizer)
-
         return loss_cls, loss_bbox
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
@@ -559,7 +561,7 @@ class NoisyAnchorHead(AnchorHead):
         cls_scores = torch.cat(
             [cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cs in cls_scores], dim=0)
         bbox_preds = torch.cat(
-            [bbp.reshape(-1, 4) for bbp in bbox_preds], dim=0)
+            [bbp.permute(0, 2, 3, 1).reshape(-1, 4) for bbp in bbox_preds], dim=0)
         all_anchor_list = torch.cat(
             [aa.reshape(-1, 4) for aa in all_anchor_list], dim=0)
         anchor_ious = torch.cat(
