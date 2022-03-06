@@ -7,11 +7,21 @@ from .noisy_anchor_head import NoisyAnchorHead
 
 @HEADS.register_module()
 class NoisyAnchorRetinaHead(NoisyAnchorHead):
+    """
+    RetinaHead with noisy anchor implementation
+
+    Args (Additional to RetinaHead):
+        max_n_bbox_per_gt (int): max number of bbox per gt
+        cleanliness_alpha (int): cleanliness score weight
+        reweight_gamma (float): reweight loss weight
+        focal_loss_alpha (float): focal loss weight
+        focal_loss_gamma: (float): focal loss weight
+    """
     def __init__(self,
                  num_classes,
                  in_channels,
                  max_n_bbox_per_gt=30,
-                 cleanliness_alpha=0.75,
+                 cleanliness_alpha=0.90,
                  reweight_gamma=1.0,
                  focal_loss_alpha=0.25,
                  focal_loss_gamma=2.0,

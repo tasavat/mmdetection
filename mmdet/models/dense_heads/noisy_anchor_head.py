@@ -28,7 +28,14 @@ class NoisyAnchorHead(AnchorHead):
         num_classes (int): Number of categories excluding the background
             category.
         in_channels (int): Number of channels in the input feature map.
+
     Args (Optional):
+        max_n_bbox_per_gt (int): max number of bbox per gt
+        cleanliness_alpha (int): cleanliness score weight
+        reweight_gamma (float): reweight loss weight
+        focal_loss_alpha (float): focal loss weight
+        focal_loss_gamma: (float): focal loss weight
+
         feat_channels (int): Number of hidden channels. Used in child classes.
         anchor_generator (dict): Config dict for anchor generator
         bbox_coder (dict): Config of bounding box coder.
@@ -48,9 +55,9 @@ class NoisyAnchorHead(AnchorHead):
                  num_classes, 
                  in_channels, 
                  max_n_bbox_per_gt=30, 
-                 cleanliness_alpha=0.75, 
+                 cleanliness_alpha=0.90, 
                  reweight_gamma=1.0,
-                 focal_loss_alpha=0.25,
+                 focal_loss_alpha=0.50,
                  focal_loss_gamma=2.0,
                  **kwargs):
         self.max_n_bbox_per_gt = max_n_bbox_per_gt
@@ -67,7 +74,7 @@ class NoisyAnchorHead(AnchorHead):
         """
         self.loss_normalizer = 100  # initialize with any reasonable #fg that's not too small
         self.loss_normalizer_momentum = 0.9
-        self.logits_clip = 5.0
+        self.logits_clip = 5.0  # clip logits before applying sigmoid to prevent numerical issues
 
         # overide default assigner with TopNIoUAssigner
         kwargs['train_cfg']['assigner'] = dict(
@@ -119,6 +126,7 @@ class NoisyAnchorHead(AnchorHead):
                 bbox_weights_list (list[Tensor]): BBox weights of each level
                 num_total_pos (int): Number of positive samples in all images
                 num_total_neg (int): Number of negative samples in all images
+                anchor_ious (list[Tensor]): IOU between all anchors and to their assigned gt_bboxes
         """
         inside_flags = anchor_inside_flags(flat_anchors, valid_flags,
                                            img_meta['img_shape'][:2],
@@ -143,7 +151,6 @@ class NoisyAnchorHead(AnchorHead):
 
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
-
         if len(pos_inds) > 0:
             if not self.reg_decoded_bbox:
                 pos_bbox_targets = self.bbox_coder.encode(
@@ -285,27 +292,27 @@ class NoisyAnchorHead(AnchorHead):
 
         return res + tuple(rest_results)
 
-    def loss_single(self, cls_score, bbox_pred, anchors, anchor_ious, anchor_ious_img_idx, 
+    def loss_single(self, cls_score, bbox_pred, anchors, anchor_ious, 
                     labels, label_weights, bbox_targets, bbox_weights):
         """Compute loss
 
         Args:
-            cls_score (Tensor): Box scores for each scale level
-                Has shape (N, num_anchors * num_classes, H, W).
-            bbox_pred (Tensor): Box energies / deltas for each scale
-                level with shape (N, num_anchors * 4, H, W).
-            anchors (Tensor): Box reference for each scale level with shape
-                (N, num_total_anchors, 4).
-            anchor_ious (Tensor): IOU between anchors and gt boxes with shape
-                (N, num_total_anchors)
+            cls_score (Tensor): Box scores for all scale levels
+                Has shape (N * num_anchors * H * W, num_classes).
+            bbox_pred (Tensor): Box energies / deltas for all scale levels 
+                with shape (N * num_anchors * H * W, 4).
+            anchors (Tensor): Box reference for all scale levels with shape
+                (N * num_total_anchors, 4).
+            anchor_ious (Tensor): IOU between anchors and their assigned gt bboxes 
+                with shape (N * num_total_anchors)
             labels (Tensor): Labels of each anchors with shape
-                (N, num_total_anchors).
+                (N * num_total_anchors).
             label_weights (Tensor): Label weights of each anchor with shape
-                (N, num_total_anchors)
+                (N * num_total_anchors)
             bbox_targets (Tensor): BBox regression targets of each anchor
-                weight shape (N, num_total_anchors, 4).
+                weight shape (N * num_total_anchors, 4).
             bbox_weights (Tensor): BBox regression loss weights of each anchor
-                with shape (N, num_total_anchors, 4).
+                with shape (N * num_total_anchors, 4).
 
         Returns:
             dict[str, Tensor]: A dictionary of loss components.
@@ -315,13 +322,13 @@ class NoisyAnchorHead(AnchorHead):
             cls_s_list: torch.Tensor, 
             loc_acc_list: torch.Tensor, 
             pos_inds: torch.Tensor, 
-            alpha: float,
-        ) -> torch.Tensor:
+            alpha: float) -> torch.Tensor:
             """
             Generate soft labels
             Args:
-                cls_s_list (FloatTensor): classification score of each anchor.
-                loc_acc_list (FloatTensor): IoU of each anchor (0 if negative).
+                cls_s_list (Tensor): classification confidence of each anchor.
+                loc_acc_list (Tensor): IoU of each anchor to its assigned gt (0 if negative).
+                pos_inds (Tensor): indices of positive anchors.
                 alpha (float): weight of localization loss [0, 1].
             Returns:
                 Tensor: soft labels of each anchor
@@ -347,13 +354,13 @@ class NoisyAnchorHead(AnchorHead):
             loc_acc_list: torch.Tensor, 
             pos_inds: torch.Tensor, 
             alpha: float, 
-            gamma: float
-        ) -> torch.Tensor:
+            gamma: float) -> torch.Tensor:
             """
             Generate re-weighting coefficients
             Args:
-                cls_s_list (Tensor): classification score of each anchor.
-                loc_acc_list (Tensor): IoU of each anchor (0 if negative).
+                cls_s_list (Tensor): classification confidence of each anchor.
+                loc_acc_list (Tensor): IoU of each anchor to its assigned gt (0 if negative).
+                pos_inds (Tensor): indices of positive anchors.
                 alpha (float): weight of localization loss [0, 1].
                 gamma (float): reweight variance score
             Returns:
@@ -377,10 +384,9 @@ class NoisyAnchorHead(AnchorHead):
             gt_classes: torch.Tensor,
             soft_targets: torch.Tensor,
             foreground_idxs: torch.Tensor,
-            alpha: float = 0.25,
+            alpha: float = 0.50,
             gamma: float = 2,
-            num_classes: int = 80,
-        ) -> torch.Tensor:
+            num_classes: int = 80) -> torch.Tensor:
             """
             Focal Loss which accepts soft label as well, other than hard binary label. 
             """
@@ -397,43 +403,13 @@ class NoisyAnchorHead(AnchorHead):
             loss = - sl * term1 * alpha - bg_st * term2 * (1 - alpha)
             return loss
 
-        """
-        # we have extracted at-most [max_n_bbox_per_gt] per image/gt/scale-level
-        # we now reduce the number of positive bbox to match [max_n_bbox_per_gt] per image/gt only
-        # thus, we need to select top-[max_n_bbox_per_gt] from each image/gt with different scale-level
-        pos_inds = torch.zeros_like(anchor_ious, dtype=torch.long)
-        unique_img_inds = torch.unique(anchor_ious_img_idx)
-        for img_idx in unique_img_inds:
-            unique_gt_inds = torch.unique(labels[anchor_ious_img_idx == img_idx])
-            for gt_idx in unique_gt_inds:
-                # skip background class
-                if gt_idx == self.num_classes:
-                    continue
-                # select top-k positive bboxes on different scale-level
-                unique_img_gt_inds = torch.nonzero(
-                    (labels == gt_idx) & (anchor_ious_img_idx == img_idx) & (anchor_ious > 0)
-                )
-                if unique_img_gt_inds.shape[0] > 0:
-                    unique_img_gt_inds = unique_img_gt_inds.squeeze(1)
-                    _, top_inds = torch.topk(
-                        anchor_ious[unique_img_gt_inds], min(self.max_n_bbox_per_gt, unique_img_gt_inds.shape[0])
-                    )
-                    pos_inds[unique_img_gt_inds[top_inds]] = 1
-        # convert from boolean to indices
-        pos_inds = torch.nonzero(pos_inds).squeeze(1)
-        """
         pos_inds = torch.nonzero(anchor_ious > 0).squeeze(1)
-
-        # need at least 2 positive samples to compute loss
-        if len(pos_inds) < 2:
-            raise ValueError(f'Not enough positive anchors: {len(pos_inds)}')
-
-        # calculate soft labels and re-weighting coefficients
-        cls_score = torch.clamp(cls_score, -self.logits_clip, self.logits_clip)
+        cls_score = torch.clamp(cls_score, -self.logits_clip, self.logits_clip)  # clamp logits to avoid inf/nan
         cls_conf = torch.sigmoid(cls_score)
         label_inds = torch.clamp(labels, max=self.num_classes-1) # for bg class we use indices of the last class for now
         cls_label_conf = torch.gather(cls_conf, dim=1, index=label_inds.unsqueeze(1)).squeeze(1)
 
+        # calculate soft labels and re-weighting coefficients
         soft_labels = calculate_soft_labels(
             cls_label_conf, 
             anchor_ious, 
@@ -541,22 +517,6 @@ class NoisyAnchorHead(AnchorHead):
             concat_anchor_list.append(torch.cat(anchor_list[i]))
         all_anchor_list = images_to_levels(concat_anchor_list, num_level_anchors)
 
-        # later, we will need to know which image each anchor iou value is from
-        # so we need to store the index of the image corresponding to each anchor iou value
-        # anchor_ious has a shape of (feature_level, num_img, num_total_anchors)
-        anchor_ious_img_idx = []
-        # create an index tensor with the size of num_anchors in each feature level
-        for i, feature_level in enumerate(anchor_ious):
-            feature_level_img_idx = []
-            for img_idx in range(feature_level.size(0)):
-                feature_level_img_idx.append(
-                    feature_level[img_idx].new_full(
-                        (feature_level[img_idx].size(0),),
-                        img_idx,
-                        dtype=torch.long))
-            feature_level_img_idx = torch.cat(feature_level_img_idx, dim=0)
-            anchor_ious_img_idx.append(feature_level_img_idx)
-
         # concat all levels into a single tensor
         cls_scores = torch.cat(
             [cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cs in cls_scores], dim=0)
@@ -566,8 +526,6 @@ class NoisyAnchorHead(AnchorHead):
             [aa.reshape(-1, 4) for aa in all_anchor_list], dim=0)
         anchor_ious = torch.cat(
             [aa.reshape(-1) for aa in anchor_ious], dim=0)
-        anchor_ious_img_idx = torch.cat(
-            [aa.reshape(-1) for aa in anchor_ious_img_idx], dim=0)
         labels_list = torch.cat(
             [ll.reshape(-1) for ll in labels_list], dim=0)
         label_weights_list = torch.cat(
@@ -582,7 +540,6 @@ class NoisyAnchorHead(AnchorHead):
             bbox_preds,
             all_anchor_list,
             anchor_ious,
-            anchor_ious_img_idx,
             labels_list,
             label_weights_list,
             bbox_targets_list,

@@ -17,7 +17,7 @@ class TopNIoUAssigner(BaseAssigner):
     - semi-positive integer: positive sample, index (0-based) of assigned gt
 
     Args:
-        max_n_bbox_per_gt (float): Maximum number of positive bbox matched to each gt.
+        max_n_bbox_per_gt (int): Maximum number of positive bbox matched to each gt.
         min_pos_iou (float): Minimum iou for a bbox to be considered as a
             positive bbox. Positive samples can have smaller IoU than
             pos_iou_thr due to the 4th step (assign max IoU sample to each gt).
@@ -45,11 +45,9 @@ class TopNIoUAssigner(BaseAssigner):
         The assignment is done in following steps, the order matters.
 
         1. assign every bbox to the background
-        2. assign proposals whose iou with all gts < neg_iou_thr to 0
-        3. for each bbox, if the iou with its nearest gt >= pos_iou_thr,
-           assign it to that bbox
-        4. for each gt bbox, assign its nearest proposals (may be more than
-           one) to itself
+        2. assign proposals whose iou with all gts < min_pos_iou to 0
+        3. for each gt bbox, assign the max_n_bbox_per_gt bboxes with the highest iou to this
+        4. if any proposal is assign to multiple gts, choose the one with highest iou
 
         Args:
             bboxes (Tensor): Bounding boxes to be assigned, shape(n, 4).
@@ -103,7 +101,7 @@ class TopNIoUAssigner(BaseAssigner):
         """
         num_gts, num_bboxes = overlaps.size(0), overlaps.size(1)
 
-        # 1. assign 0 (negative) by default
+        # 1. assign negative by default
         assigned_gt_inds = overlaps.new_full((num_bboxes, ),
                                              0,
                                              dtype=torch.long)
@@ -134,14 +132,15 @@ class TopNIoUAssigner(BaseAssigner):
         # for each gt, the sorted iou of all proposals
         gt_sort_overlaps, gt_argsort_overlaps = torch.sort(overlaps, 1, descending=True)
 
-        # 2. assign positive: for each gt, select top n proposals
+        # 2. assign positive: for each gt, select top-n proposals
         for i in range(num_gts):
             top_n_ious = gt_sort_overlaps[i, :self.max_n_bbox_per_gt]
             top_n_iou_inds = gt_argsort_overlaps[i, :self.max_n_bbox_per_gt]
             for iou, ind in zip(top_n_ious, top_n_iou_inds):
+                # 3. skip bbox that iou with gt is too small
                 if iou <= self.min_pos_iou:
                     break
-                # in case of assignment collision, prioritize the gt with higher iou
+                # 4. in case of assignment collision, prioritize the gt with higher iou
                 if assigned_gt_inds[ind] != 0:
                     previous_assigned_gt = assigned_gt_inds[ind] - 1
                     if overlaps[previous_assigned_gt, ind] < iou:
@@ -160,5 +159,4 @@ class TopNIoUAssigner(BaseAssigner):
         else:
             assigned_labels = None
 
-        return AssignResult(
-            num_gts, assigned_gt_inds, assigned_gt_ious, labels=assigned_labels)
+        return AssignResult(num_gts, assigned_gt_inds, assigned_gt_ious, labels=assigned_labels)
